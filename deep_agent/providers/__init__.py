@@ -5,6 +5,7 @@ from deep_agent.providers.toolkit_injector import ToolkitInjectorProvider
 from deep_agent.providers.todo import TodoProvider
 from deep_agent.providers.delegate_task import DelegateTaskProvider
 from deep_agent.providers.filesystem_provider import FilesystemProvider
+from deep_agent.providers.session_bridge import SessionBridgeProvider
 
 __all__ = [
     "TrackedCompactionProvider",
@@ -12,4 +13,5 @@ __all__ = [
     "TodoProvider",
     "DelegateTaskProvider",
     "FilesystemProvider",
+    "SessionBridgeProvider",
 ]

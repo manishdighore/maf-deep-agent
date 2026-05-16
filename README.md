@@ -49,7 +49,7 @@ You get a standard `Agent` back — works with `run()`, `run_stream()`, DevServe
 | Feature | What it does |
 |---------|-------------|
 | 🗜️ **Auto Summarization** | Automatically summarizes old messages when context grows too large. Never hit token limits. |
-| 🔧 **Skill Lifecycle** | Load/unload tool groups on demand via `load_skill`. Tools appear and disappear per session. |
+| 🔧 **Skill Lifecycle** | Load/unload tool groups on demand via `load_skill`. Tools appear **same-turn** — no waiting for next turn. |
 | 📦 **Toolkit Offloading** | When compaction removes a `load_skill` call, the associated tools are automatically unloaded. |
 | 📝 **Task Management** | Built-in `todo` tool for tracking multi-step work within a session. |
 | 🚀 **Sub-Agent Delegation** | Spawn focused child agents with `delegate_task` — batch mode, concurrent execution. |
@@ -67,31 +67,39 @@ graph TB
     subgraph "create_deep_agent()"
         direction TB
 
+        SD["shared_state dict<br/><i>enabled_toolkits bridge</i>"]
+
         subgraph providers ["Context Providers (ordered)"]
+            SB["SessionBridgeProvider<br/><i>hydrates shared_state from session</i>"]
             H["InMemoryHistoryProvider<br/><i>skip_excluded=True</i>"]
             C["TrackedCompactionProvider<br/><i>after_strategy=Summarization</i>"]
             S["SkillsProvider<br/><i>load_skill tool</i>"]
-            TI["ToolkitInjectorProvider<br/><i>injects enabled tools per turn</i>"]
             T["TodoProvider<br/><i>task management tool</i>"]
             D["DelegateTaskProvider<br/><i>sub-agent spawning</i>"]
             FS["FilesystemProvider<br/><i>ls, read, write, edit, glob, grep</i>"]
         end
 
         subgraph middleware ["Middleware"]
-            SM["SkillToolkitMiddleware<br/><i>intercepts load_skill → enables tools</i>"]
+            SM["SkillToolkitMiddleware<br/><i>writes shared_state + session.state</i>"]
+            SF["SkillToolFilterMiddleware<br/><i>reads shared_state → filters tools per LLM call</i>"]
             LM["LLMCallLogMiddleware<br/><i>rich panels with stats</i>"]
             LO["LargeOutputMiddleware<br/><i>spills big outputs to /.outputs/</i>"]
         end
 
-        H --> C --> S --> TI --> T --> D --> FS
+        SB --> H --> C --> S --> T --> D --> FS
+        SD -.-> SB
+        SD -.-> SM
+        SD -.-> SF
     end
 
-    User([User Message]) --> H
+    User([User Message]) --> SB
     D --> Child([Sub-Agent])
 
     style C fill:#ff9,stroke:#333
-    style TI fill:#9f9,stroke:#333
+    style SD fill:#f9f,stroke:#333
     style SM fill:#9cf,stroke:#333
+    style SF fill:#9cf,stroke:#333
+    style SB fill:#9f9,stroke:#333
 ```
 
 ### How Compaction Works
@@ -122,34 +130,111 @@ sequenceDiagram
     A->>LLM: 9 messages instead of 24 ✅
 ```
 
-### Skill Lifecycle
+### Skill Lifecycle — Same-Turn Tool Injection
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Available: Skills registered
-    Available --> Loaded: LLM calls load_skill("web-research")
-    Loaded --> Active: SkillToolkitMiddleware writes to session state
-    Active --> Injected: ToolkitInjectorProvider injects tools each turn
-    Injected --> Active: Turn ends
-    Active --> Offloaded: Compaction removes load_skill call
-    Offloaded --> Available: Tools removed from session
+    [*] --> Registered: Skills + toolkits passed to create_deep_agent()
+    Registered --> Loaded: LLM calls load_skill("database-analysis")
+    Loaded --> WrittenToBoth: SkillToolkitMiddleware writes session.state + shared_state
+    WrittenToBoth --> VisibleToLLM: SkillToolFilterMiddleware reads shared_state on next LLM call
+    VisibleToLLM --> Offloaded: Compaction removes load_skill call
+    Offloaded --> Registered: Tools removed from session.state
+
+    state "Session Reload" as SR
+    Registered --> SR: Session deserialized from storage
+    SR --> VisibleToLLM: SessionBridgeProvider hydrates shared_state from session.state
 ```
+
+### The Token Problem — Why Skill Offloading Matters
+
+Every tool sent to the LLM costs tokens in the request schema. A typical function tool definition is **300–800 tokens**. With 20+ tools, you're burning **6,000–16,000 tokens per LLM call** just on tool definitions — before any conversation content.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Without Skill Offloading                   │
+│                                                             │
+│  LLM Call #1:  20 tools × ~500 tokens = 10,000 tokens      │
+│  LLM Call #2:  20 tools × ~500 tokens = 10,000 tokens      │
+│  LLM Call #3:  20 tools × ~500 tokens = 10,000 tokens      │
+│  ...                                                        │
+│  10-call session: ~100,000 tokens on tool schemas alone!    │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                  With Skill Offloading                      │
+│                                                             │
+│  LLM Call #1:  4 base tools  = 2,000 tokens  (no skills)   │
+│  LLM Call #2:  4 base + load_skill called                   │
+│  LLM Call #3:  4 base + 3 DB tools = 3,500 tokens          │
+│  LLM Call #4:  4 base + 3 DB tools = 3,500 tokens          │
+│  Compaction:   DB tools offloaded                           │
+│  LLM Call #5:  4 base tools  = 2,000 tokens  (clean!)      │
+│  ...                                                        │
+│  10-call session: ~25,000 tokens — 75% savings!            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### How It Works — The Shared State Bridge
+
+The framework's `ChatMiddleware` (which controls what tools the LLM sees per call) has **no access to the session object**. Meanwhile, `FunctionMiddleware` (which intercepts `load_skill`) has full session access but can't modify the tool list.
+
+maf-deep-agent bridges this gap with a **shared mutable dict** — a plain Python object passed by reference to three components:
+
+```mermaid
+sequenceDiagram
+    participant SB as SessionBridgeProvider<br/>(ContextProvider)
+    participant SD as shared_state dict
+    participant STM as SkillToolkitMiddleware<br/>(FunctionMiddleware)
+    participant STF as SkillToolFilterMiddleware<br/>(ChatMiddleware)
+    participant LLM as LLM
+
+    Note over SB,LLM: Turn Start (before_run)
+    SB->>SD: Hydrate from session.state["enabled_toolkits"]
+    Note over SD: {"enabled_toolkits": {"db-analysis"}}
+
+    Note over SB,LLM: LLM Call #1
+    STF->>SD: Read enabled_toolkits
+    SD-->>STF: {"db-analysis"}
+    STF->>LLM: base tools + db-analysis tools ✅
+
+    Note over SB,LLM: LLM calls load_skill("web-search")
+    STM->>SD: Add "web-search" to shared_state
+    STM->>STM: Also write to session.state (durable)
+
+    Note over SB,LLM: LLM Call #2 (same turn!)
+    STF->>SD: Read enabled_toolkits
+    SD-->>STF: {"db-analysis", "web-search"}
+    STF->>LLM: base tools + db + web tools ✅
+```
+
+**Key design decisions:**
+
+| Concern | Solution |
+|---------|----------|
+| Same-turn availability | `ChatMiddleware` fires per LLM call, not per turn — sees updates immediately |
+| Session persistence | `SkillToolkitMiddleware` writes to **both** `session.state` (durable) and `shared_state` (live) |
+| Session reload | `SessionBridgeProvider.before_run()` hydrates `shared_state` from `session.state` every turn |
+| Mutation safety | `SkillToolFilterMiddleware` always rebuilds from the authoritative `all_tools` list, never from `context.options["tools"]` |
+| Concurrency | Single agent instance per session — no concurrent access to shared dict |
 
 ### How Skills & Toolkits Work
 
-1. **You register skills and their toolkits** — each skill name maps to a list of tools (e.g. `"web-research" → [tavily_search]`). The mapping is a plain `dict`, shared by reference.
+1. **You register skills and their toolkits** — each skill name maps to a list of tools (e.g. `"web-research" → [tavily_search]`). All tools are registered on the agent at build time so the framework can always execute them, but `SkillToolFilterMiddleware` hides unloaded ones from the LLM.
 
-2. **Tools are NOT sent to the LLM until loaded** — on startup the LLM only sees `load_skill`. No toolkit tools are in context. This keeps the initial tool list small.
+2. **Tools are NOT sent to the LLM until loaded** — on startup the LLM only sees base tools + `load_skill`. No skill tools are in context. This keeps the initial tool schema small and saves tokens.
 
-3. **LLM calls `load_skill("web-research")`** — `SkillToolkitMiddleware` intercepts this, looks up `skill_toolkits["web-research"]`, and writes those tool references into `session.state["enabled_toolkits"]`.
+3. **LLM calls `load_skill("web-research")`** — `SkillToolkitMiddleware` (FunctionMiddleware) intercepts this, writes `"web-research"` to both `session.state["enabled_toolkits"]` (durable) and the shared dict (live bridge).
 
-4. **Every subsequent turn, tools are injected** — `ToolkitInjectorProvider` reads `session.state["enabled_toolkits"]` during `before_run` and calls `context.extend_tools()`. The LLM now sees `tavily_search` alongside `load_skill`.
+4. **On the very next LLM call (same turn!)** — `SkillToolFilterMiddleware` (ChatMiddleware) reads the shared dict, sees `"web-research"` is enabled, and includes `tavily_search` in the tool list sent to the LLM. No need to wait for the next turn.
 
-5. **When context grows too large, compaction summarizes old messages** — if the `load_skill("web-research")` call gets summarized away, `TrackedCompactionProvider` detects it and **automatically removes those tools from the session**. The LLM no longer sees `tavily_search`. Context shrinks.
+5. **On every new turn** — `SessionBridgeProvider.before_run()` hydrates the shared dict from `session.state`, ensuring previously loaded skills are visible from the first LLM call.
 
-6. **The skill can be loaded again** — if the LLM needs web search later, it calls `load_skill("web-research")` again. The tools reappear. No state is lost — the skill definition still exists.
+6. **When context grows too large, compaction summarizes old messages** — if the `load_skill("web-research")` call gets summarized away, `TrackedCompactionProvider` detects it and **automatically removes those tools from the session**. The LLM no longer sees `tavily_search`. Context shrinks.
 
-**Why this matters:** A typical agent with 20+ tools sends all tool schemas every turn (~2,000 tokens each). With skill-based loading, you only pay for the tools the LLM is actively using. Compaction-driven offloading means even those tools get cleaned up when they're no longer referenced in the conversation.
+7. **The skill can be loaded again** — if the LLM needs web search later, it calls `load_skill("web-research")` again. The tools reappear. No state is lost — the skill definition still exists.
+
+**Why this matters:** A typical agent with 20+ tools sends all tool schemas every turn (~500 tokens each). With skill-based loading, you only pay for the tools the LLM is actively using. Compaction-driven offloading means even those tools get cleaned up when they're no longer referenced in the conversation. For a 20-tool agent over a 10-call session, this can save **75%+ of tool schema tokens**.
 
 ### Virtual Filesystem & Large Output Spilling
 
@@ -296,17 +381,17 @@ The framework calls `before_run` on context providers **in list order**, and `af
 
 ```
 before_run order:                after_run order (reversed):
-  1. InMemoryHistoryProvider       7. ← your extras
-  2. TrackedCompactionProvider     6. ← FilesystemProvider (if enabled)
-  3. SkillsProvider                5. ← DelegateTaskProvider
-  4. ToolkitInjectorProvider       4. ← TodoProvider
-  5. TodoProvider                  3. ← ToolkitInjectorProvider
-  6. DelegateTaskProvider          2. ← TrackedCompactionProvider
-  7. FilesystemProvider (if on)    1. ← InMemoryHistoryProvider
-  8. → your extras
+  1. SessionBridgeProvider         8. ← your extras
+  2. InMemoryHistoryProvider       7. ← FilesystemProvider (if enabled)
+  3. TrackedCompactionProvider     6. ← DelegateTaskProvider
+  4. SkillsProvider                5. ← TodoProvider
+  5. TodoProvider                  4. ← SkillsProvider
+  6. DelegateTaskProvider          3. ← TrackedCompactionProvider
+  7. FilesystemProvider (if on)    2. ← InMemoryHistoryProvider
+  8. → your extras                 1. ← SessionBridgeProvider
 ```
 
-Middleware wraps the LLM call as an onion — your extras wrap the outermost layer after the built-in `SkillToolkitMiddleware` and `LLMCallLogMiddleware`.
+Middleware wraps the LLM call as an onion — your extras wrap the outermost layer after the built-in `SkillToolkitMiddleware`, `SkillToolFilterMiddleware`, and `LLMCallLogMiddleware`.
 
 ---
 
@@ -342,6 +427,21 @@ async def handle_message(ws, msg, agent, session):
             await ws.send_json(event.model_dump())
 ```
 
+## Sub-Agent Streaming
+
+Sub-agent tokens don't surface through the parent's `run_stream()` — they run inside a tool call which is opaque to the framework. `maf-deep-agent` provides `stream_with_subagents()` which merges parent and sub-agent tokens into a single stream of native `AgentResponseUpdate` objects:
+
+```python
+from deep_agent import stream_with_subagents
+
+async for update in stream_with_subagents(agent, "Research AI", session=session):
+    # update.author_name distinguishes parent ("maf-deep-agent") vs sub-agent ("python-researcher")
+    # update.finish_reason == "stop" means that source is done
+    print(f"[{update.author_name}] {update.text}")
+```
+
+No custom types — every event is a framework-native `AgentResponseUpdate` with `author_name` set to identify the source. See [docs/SUBAGENT_STREAMING.md](docs/SUBAGENT_STREAMING.md) for the low-level API, FastAPI WebSocket example, and framework caveats.
+
 ---
 
 ## Comparison
@@ -349,13 +449,15 @@ async def handle_message(ws, msg, agent, session):
 | Capability | Raw Agent Framework | maf-deep-agent |
 |-----------|-------------------|------------|
 | Context management | Manual | ✅ Auto summarization |
-| Tool lifecycle | Manual | ✅ load/unload via skills |
+| Tool lifecycle | Manual | ✅ Same-turn load/unload via skills |
 | Toolkit offloading | Not built-in | ✅ Auto on compaction |
+| Tool token savings | N/A — all tools every call | ✅ 75%+ schema token savings |
 | Task tracking | Not built-in | ✅ Built-in todo tool |
 | Sub-agent delegation | Manual | ✅ One call with batching |
 | Observability | Basic logging | ✅ Rich panels + token counts |
 | Virtual filesystem | Not built-in | ✅ Session-scoped, blob-persistent |
 | Large output mgmt | Manual | ✅ Auto-spill to FS, agent reads on demand |
+| Session reload | Manual | ✅ Skills auto-rehydrated from session state |
 | Setup | ~50 lines of wiring | ✅ 1 function call |
 
 ---
@@ -369,20 +471,21 @@ deep_agent/
 ├── .env.example
 ├── deep_agent/
 │   ├── __init__.py                 # create_deep_agent
-│   ├── _builder.py                 # factory function + provider wiring
+│   ├── _builder.py                 # factory function + provider/middleware wiring
 │   ├── _logging.py                 # rich console, agent_log, icons
 │   ├── providers/
 │   │   ├── compaction.py           # TrackedCompactionProvider
-│   │   ├── toolkit_injector.py     # ToolkitInjectorProvider
+│   │   ├── session_bridge.py       # SessionBridgeProvider (hydrates shared_state)
 │   │   ├── todo.py                 # TodoProvider
 │   │   ├── delegate_task.py        # DelegateTaskProvider
 │   │   └── filesystem_provider.py  # FilesystemProvider
 │   ├── middlewares/
-│   │   ├── skill_toolkit.py        # SkillToolkitMiddleware
-│   │   ├── llm_logger.py          # LLMCallLogMiddleware
-│   │   └── large_output.py        # LargeOutputMiddleware
+│   │   ├── skill_toolkit.py        # SkillToolkitMiddleware (FunctionMiddleware)
+│   │   ├── skill_tool_filter.py    # SkillToolFilterMiddleware (ChatMiddleware)
+│   │   ├── llm_logger.py           # LLMCallLogMiddleware
+│   │   └── large_output.py         # LargeOutputMiddleware
 │   └── services/
-│       └── filesystem.py          # ThreadedStateFilesystem
+│       └── filesystem.py           # ThreadedStateFilesystem
 └── examples/
     ├── minimal.py
     └── generalist.py

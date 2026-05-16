@@ -28,6 +28,7 @@ _ICONS: dict[str, str] = {
     "done": "✅",
     "pruned": "🧹",
     "persisted": "💾",
+    "spilled": "📂",
 }
 
 

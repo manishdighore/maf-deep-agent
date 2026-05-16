@@ -47,6 +47,7 @@ class FilesystemProvider(ContextProvider):
         super().__init__(source_id)
         self._fs = fs
         self._inject_summary = inject_summary
+        self._tools_cache: dict[str, list[FunctionTool]] = {}
 
     async def before_run(
         self,
@@ -58,9 +59,13 @@ class FilesystemProvider(ContextProvider):
     ) -> None:
         tid = session.session_id
 
+        # Tools are bound to tid via closure — reuse across turns
+        if tid not in self._tools_cache:
+            self._tools_cache[tid] = self._build_tools(tid)
+
         context.extend_tools(
             self.source_id,
-            self._build_tools(tid),
+            self._tools_cache[tid],
         )
 
         if self._inject_summary:

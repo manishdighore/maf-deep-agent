@@ -1,6 +1,7 @@
 """LargeOutputMiddleware — spills oversized tool results to the virtual filesystem.
 
-When a tool returns more than ``threshold`` characters, this middleware:
+When a tool's output exceeds ``threshold`` estimated tokens (chars ÷ 4), this
+middleware:
 
 1. Writes the **full** output (with a metadata header) into the session-scoped
    ``ThreadedStateFilesystem`` under ``/.outputs/{tool}_{call_id}.md``.
@@ -15,7 +16,7 @@ Usage::
     from deep_agent.middlewares import LargeOutputMiddleware
 
     fs = ThreadedStateFilesystem()
-    middleware = LargeOutputMiddleware(fs=fs)
+    middleware = LargeOutputMiddleware(fs=fs)  # spills at ~1,000 tokens
 """
 
 from __future__ import annotations
@@ -32,6 +33,9 @@ from deep_agent._logging import agent_log
 from deep_agent.services.filesystem import ThreadedStateFilesystem
 
 logger = logging.getLogger(__name__)
+
+# Rough token estimate: 1 token ≈ 4 characters (same heuristic as DeepAgents)
+CHARS_PER_TOKEN = 4
 
 # Tools whose output should never be spilled (filesystem tools themselves,
 # to avoid circular writes).
@@ -84,7 +88,8 @@ class LargeOutputMiddleware(FunctionMiddleware):
     fs : ThreadedStateFilesystem
         Shared filesystem instance (same one used by ``FilesystemProvider``).
     threshold : int
-        Minimum character count to trigger spilling (default 4 000).
+        Estimated token count to trigger spilling (default 5 000 tokens,
+        i.e. ~20 000 chars using the chars÷4 heuristic).
     head : int
         Characters to keep at the start of the truncated result (default 500).
     tail : int
@@ -98,7 +103,7 @@ class LargeOutputMiddleware(FunctionMiddleware):
         self,
         fs: ThreadedStateFilesystem,
         *,
-        threshold: int = 4_000,
+        threshold: int = 5_000,
         head: int = 500,
         tail: int = 200,
         exclude_tools: set[str] | frozenset[str] | None = None,
@@ -129,7 +134,11 @@ class LargeOutputMiddleware(FunctionMiddleware):
 
         # Extract text from result
         text = _extract_text(context.result)
-        if text is None or len(text) <= self._threshold:
+        if text is None:
+            return
+
+        est_tokens = len(text) // CHARS_PER_TOKEN
+        if est_tokens <= self._threshold:
             return
 
         # ── Spill to filesystem ─────────────────────────────────────
@@ -150,7 +159,7 @@ class LargeOutputMiddleware(FunctionMiddleware):
             f"# Tool Output: {tool_name}\n"
             f"**Call ID:** {call_id}\n"
             f"**Args:** {args_str}\n"
-            f"**Length:** {len(text):,} chars\n"
+            f"**Length:** {len(text):,} chars (~{est_tokens:,} tokens)\n"
             f"---\n"
         )
         full_content = header + text
@@ -169,7 +178,7 @@ class LargeOutputMiddleware(FunctionMiddleware):
             truncated_parts.append(tail_text)
 
         truncated_parts.append(
-            f"\n\n⚠️ Output truncated ({len(text):,} chars). "
+            f"\n\n⚠️ Output truncated (~{est_tokens:,} tokens, {len(text):,} chars). "
             f"Full result saved to: {file_path}\n"
             f'Use read_file("{file_path}") to view.'
         )
@@ -178,5 +187,5 @@ class LargeOutputMiddleware(FunctionMiddleware):
 
         agent_log(
             "LargeOutputMiddleware", "spilled",
-            f"{tool_name} → {len(text):,} chars → {file_path}",
+            f"{tool_name} → ~{est_tokens:,} tokens ({len(text):,} chars) → {file_path}",
         )

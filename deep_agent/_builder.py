@@ -10,12 +10,17 @@ from agent_framework._skills import SkillsProvider
 
 from deep_agent.providers import (
     TrackedCompactionProvider,
-    ToolkitInjectorProvider,
     TodoProvider,
     DelegateTaskProvider,
     FilesystemProvider,
+    SessionBridgeProvider,
 )
-from deep_agent.middlewares import SkillToolkitMiddleware, LLMCallLogMiddleware, LargeOutputMiddleware
+from deep_agent.middlewares import (
+    SkillToolkitMiddleware,
+    SkillToolFilterMiddleware,
+    LLMCallLogMiddleware,
+    LargeOutputMiddleware,
+)
 from deep_agent.services.filesystem import ThreadedStateFilesystem
 
 
@@ -36,6 +41,7 @@ def create_deep_agent(
     fs_exclude_tools: set[str] | None = None,
     context_providers: list[Any] | None = None,
     middleware: list[Any] | None = None,
+    default_options: dict[str, Any] | None = None,
 ) -> Agent:
     """Create a batteries-included agent with skills, compaction, todo, and delegation.
 
@@ -78,6 +84,16 @@ def create_deep_agent(
     if skills is None:
         skills = []
 
+    # ── Collect all skill tools upfront (flat list across all toolkits) ──
+    # Registered on the agent at init so the function-invocation registry always
+    # knows how to execute them. SkillToolFilterMiddleware then gates *visibility*
+    # to the LLM based on session.state["enabled_toolkits"] per LLM call.
+    all_skill_tools: list[FunctionTool] = [
+        t for toolkit_tools in skill_toolkits.values() for t in toolkit_tools
+    ]
+    base_tools: list[FunctionTool] = list(tools or [])
+    all_agent_tools: list[FunctionTool] = base_tools + all_skill_tools
+
     # ── Auto-enrich skill instructions with tool names from skill_toolkits ──
     for skill in skills:
         skill_name = getattr(skill, "name", None)
@@ -106,14 +122,23 @@ def create_deep_agent(
         history_source_id=history.source_id,
     )
 
+    # ── Shared skill state ──
+    # Single mutable dict shared by SessionBridgeProvider (hydrates from
+    # session.state at turn start), SkillToolkitMiddleware (writes mid-turn
+    # after load_skill), and SkillToolFilterMiddleware (reads on every LLM call).
+    shared_state: dict[str, Any] = {}
+
     # ── Context providers ──
+    # SessionBridgeProvider MUST be first — it hydrates shared_state from
+    # session.state["enabled_toolkits"] so the filter middleware sees
+    # previously-loaded skills from the very first LLM call (session reload).
     all_providers: list[Any] = [
+        SessionBridgeProvider(shared_state=shared_state),
         history,
         compaction,
     ]
     if skills:
         all_providers.append(SkillsProvider(skills))
-    all_providers.append(ToolkitInjectorProvider(skill_toolkits=skill_toolkits))
     if enable_todo:
         all_providers.append(TodoProvider())
     if enable_delegation:
@@ -131,8 +156,17 @@ def create_deep_agent(
         all_providers.extend(context_providers)
 
     # ── Middleware ──
+    # Order matters:
+    #   1. SkillToolkitMiddleware  (FunctionMiddleware) — writes state after load_skill executes
+    #   2. SkillToolFilterMiddleware (ChatMiddleware)   — filters tool schema before each LLM call
+    #   3. LLMCallLogMiddleware    (ChatMiddleware)     — logs after filter so log shows real tools
     all_middleware: list[Any] = [
-        SkillToolkitMiddleware(skill_toolkits=skill_toolkits),
+        SkillToolkitMiddleware(skill_toolkits=skill_toolkits, shared_state=shared_state),
+        SkillToolFilterMiddleware(
+            all_tools=all_agent_tools,
+            skill_toolkits=skill_toolkits,
+            shared_state=shared_state,
+        ),
     ]
     if enable_logging:
         all_middleware.append(LLMCallLogMiddleware())
@@ -148,7 +182,8 @@ def create_deep_agent(
         name=name,
         client=client,
         instructions=instructions,
-        tools=tools or [],
+        tools=all_agent_tools,       # base tools + all skill tools registered upfront
         context_providers=all_providers,
         middleware=all_middleware,
+        default_options=default_options,
     )
