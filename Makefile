@@ -1,6 +1,7 @@
 .PHONY: help test lint release bump-patch bump-minor bump-major publish clean
 
-VERSION := $(shell python -c "import re; print(re.search(r'version\s*=\s*\"(.+?)\"', open('pyproject.toml').read()).group(1))")
+PYTHON := $(shell command -v python3 || command -v python)
+VERSION := $(shell $(PYTHON) -c "import re; print(re.search(r'version\s*=\s*\"(.+?)\"', open('pyproject.toml').read()).group(1))")
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -20,7 +21,7 @@ clean: ## Remove build artifacts
 # ── Version bumping ─────────────────────────────────────────────────
 
 bump-patch: ## Bump patch version (0.1.0 → 0.1.1)
-	@python -c "\
+	@$(PYTHON) -c "\
 	import re, pathlib; \
 	p = pathlib.Path('pyproject.toml'); \
 	txt = p.read_text(); \
@@ -32,7 +33,7 @@ bump-patch: ## Bump patch version (0.1.0 → 0.1.1)
 	print(f'Bumped {old} → {new}')"
 
 bump-minor: ## Bump minor version (0.1.0 → 0.2.0)
-	@python -c "\
+	@$(PYTHON) -c "\
 	import re, pathlib; \
 	p = pathlib.Path('pyproject.toml'); \
 	txt = p.read_text(); \
@@ -44,7 +45,7 @@ bump-minor: ## Bump minor version (0.1.0 → 0.2.0)
 	print(f'Bumped {old} → {new}')"
 
 bump-major: ## Bump major version (0.1.0 → 1.0.0)
-	@python -c "\
+	@$(PYTHON) -c "\
 	import re, pathlib; \
 	p = pathlib.Path('pyproject.toml'); \
 	txt = p.read_text(); \
@@ -62,8 +63,8 @@ release-minor: bump-minor _tag_and_push ## Bump minor + release to PyPI
 release-major: bump-major _tag_and_push ## Bump major + release to PyPI
 
 _tag_and_push:
-	$(eval NEW_VERSION := $(shell python -c "import re; print(re.search(r'version\s*=\s*\"(.+?)\"', open('pyproject.toml').read()).group(1))"))
-	git add pyproject.toml
+	$(eval NEW_VERSION := $(shell $(PYTHON) -c "import re; print(re.search(r'version\s*=\s*\"(.+?)\"', open('pyproject.toml').read()).group(1))"))
+	git add pyproject.toml Makefile
 	git commit -m "release v$(NEW_VERSION)"
 	git tag v$(NEW_VERSION)
 	git push && git push --tags
