@@ -1,6 +1,6 @@
 [project]
 name = "maf-deep-agent"
-version = "0.1.3"
+version = "0.1.4"
 description = "Batteries-included agent builder with skills, compaction, todo, and delegation"
 readme = "README.md"
 license = "MIT"
